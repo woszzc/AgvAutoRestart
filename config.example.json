@@ -6,6 +6,9 @@
   "end_time": "15:00",
   "weekdays": [0, 2, 4],
   "restart_delay_seconds": 10,
+  "wecom_key": "",
+  "update_url": "",
+  "log_retention_days": 30,
   "tasks": [
     {
       "enabled": true,
@@ -16,7 +19,8 @@
       "kill_port": 0,
       "start_path": "D:\\Hip\\Hip.CNC.Publish\\HiP.CNCConsole.exe",
       "start_type": "exe",
-      "run_as_admin": true
+      "run_as_admin": true,
+      "wecom_notify": false
     },
     {
       "enabled": true,
@@ -27,7 +31,8 @@
       "kill_port": 0,
       "start_path": "C:\\Users\\zhichao.zhu\\Documents\\service\\AGV\\restart.bat",
       "start_type": "bat",
-      "run_as_admin": true
+      "run_as_admin": true,
+      "wecom_notify": false
     }
   ],
   "port_monitors": [

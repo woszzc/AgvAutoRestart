@@ -2,6 +2,7 @@ import ctypes
 import csv
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -10,7 +11,12 @@ import traceback
 from datetime import datetime, time as dt_time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPointF
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QObject, QPointF
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -21,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "智能应用定时重启"
+APP_VERSION = "1.0.0"
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 ICON_FILE = BASE_DIR / "app.ico"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "AgvAutoRestart"
@@ -37,6 +44,9 @@ DEFAULT_CONFIG = {
     "end_time": "15:00",
     "weekdays": [0, 2, 4],  # Monday, Wednesday, Friday
     "restart_delay_seconds": 10,
+    "wecom_key": "",  # 企业微信群机器人 Webhook key
+    "update_url": "",  # 更新服务器清单地址
+    "log_retention_days": 30,  # 日志保留天数
     "tasks": [
         {
             "enabled": True,
@@ -46,6 +56,7 @@ DEFAULT_CONFIG = {
             "start_path": r"D:\Hip\Hip.CNC.Publish\HiP.CNCConsole.exe",
             "start_type": "exe",
             "run_as_admin": True,
+            "wecom_notify": False,
         },
         {
             "enabled": True,
@@ -55,6 +66,7 @@ DEFAULT_CONFIG = {
             "start_path": r"C:\Users\zhichao.zhu\Documents\service\AGV\restart.bat",
             "start_type": "bat",
             "run_as_admin": True,
+            "wecom_notify": False,
         },
     ],
     "port_monitors": [
@@ -408,9 +420,137 @@ def check_port_open(port, host="127.0.0.1", timeout=3):
         return False
 
 
+AUTOSTART_VALUE_NAME = "AgvAutoRestart"
+RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+LAYERS_KEY_PATH = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+
+
+def get_app_executable():
+    """返回当前程序路径：打包后是 EXE，开发模式下是 main.py 脚本。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return Path(__file__).resolve()
+
+
+def get_launch_command():
+    """开机自启的注册表命令行：打包后直接跑 EXE，开发模式用 pythonw 跑脚本。"""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    interpreter = sys.executable
+    if interpreter.lower().endswith("python.exe"):
+        interpreter = str(Path(interpreter).with_name("pythonw.exe"))
+    return f'"{interpreter}" "{get_app_executable()}"'
+
+
+def get_autostart():
+    """查询是否已开启开机自启（HKCU Run 注册表项）。"""
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ) as key:
+            value, _ = winreg.QueryValueEx(key, AUTOSTART_VALUE_NAME)
+            return bool(value)
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def set_autostart(enabled):
+    """写入/删除 HKCU Run 注册表项，实现开机登录后自动启动。"""
+    if winreg is None:
+        raise RuntimeError("当前系统不支持注册表操作")
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ, get_launch_command())
+        else:
+            try:
+                winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def get_run_as_admin_flag():
+    """查询程序是否被标记为始终以管理员身份运行（AppCompatFlags Layers）。"""
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, LAYERS_KEY_PATH, 0, winreg.KEY_READ) as key:
+            value, _ = winreg.QueryValueEx(key, str(get_app_executable()))
+            return "RUNASADMIN" in (value or "").upper()
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def set_run_as_admin_flag(enabled):
+    """通过兼容层 RUNASADMIN 标记，让程序每次启动都请求 UAC 管理员权限。"""
+    if winreg is None:
+        raise RuntimeError("当前系统不支持注册表操作")
+    exe_path = str(get_app_executable())
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, LAYERS_KEY_PATH, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, exe_path, 0, winreg.REG_SZ, "~ RUNASADMIN")
+        else:
+            try:
+                winreg.DeleteValue(key, exe_path)
+            except FileNotFoundError:
+                pass
+
+
+def send_wecom_notify(wecom_key, content):
+    """通过企业微信群机器人 webhook 发送 markdown 消息，返回接口响应。"""
+    from urllib.request import Request, urlopen
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={wecom_key}"
+    payload = json.dumps(
+        {"msgtype": "markdown", "markdown": {"content": content}}, ensure_ascii=False
+    ).encode("utf-8")
+    req = Request(url, data=payload, method="POST", headers={"Content-Type": "application/json"})
+    with urlopen(req, timeout=10) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8"))
+
+
+def parse_version(text):
+    """版本号转元组用于比较，非数字部分按 0 处理。"""
+    parts = []
+    for chunk in str(text or "").strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
+
+
+def fetch_update_info(url):
+    """从服务器拉取更新清单：{version, url, notes}。"""
+    data = http_get_json(url, timeout=10)
+    if not isinstance(data, dict):
+        raise ValueError("更新清单格式不正确，应为 JSON 对象")
+    return data
+
+
+def download_file(url, dest, timeout=300):
+    """下载文件到指定路径，返回目标路径。"""
+    from urllib.request import Request, urlopen
+    req = Request(url, method="GET", headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    with urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
+        shutil.copyfileobj(resp, f)
+    return dest
+
+
+def cleanup_old_logs(days):
+    """删除超过保留天数的历史日志文件。"""
+    if days <= 0:
+        return
+    cutoff = time.time() - days * 86400
+    for log_file in LOG_DIR.glob("*.log"):
+        try:
+            if log_file.stat().st_mtime < cutoff:
+                log_file.unlink()
+        except OSError:
+            continue
+
+
 class RestartWorker(QObject):
     log_signal = Signal(str)
     status_signal = Signal(str)
+    result_signal = Signal(str)
     today_restart_signal = Signal(bool)
 
     def __init__(self, config):
@@ -492,10 +632,8 @@ class RestartWorker(QObject):
             time.sleep(delay)
 
             # 再全部启动
-            all_ok = True
-            for task in enabled_tasks:
-                ok = self.start_task(task)
-                all_ok = all_ok and ok
+            results = [(task, self.start_task(task)) for task in enabled_tasks]
+            all_ok = all(ok for _, ok in results)
 
             # 无论个别启动是否失败，本次重启动作当天只执行一次，避免 5 分钟后反复杀进程。
             self.last_restart_date = today
@@ -504,9 +642,12 @@ class RestartWorker(QObject):
             if all_ok:
                 self.status_signal.emit("重启成功")
                 self.emit_log("本次重启全部完成")
+                self.result_signal.emit("定时重启：全部成功")
             else:
                 self.status_signal.emit("部分重启失败，请查看日志")
                 self.emit_log("本次重启完成，但存在启动失败项目")
+                self.result_signal.emit("定时重启：存在启动失败项目")
+            self.notify_results(results, "定时重启")
         except Exception as e:
             self.emit_log(f"重启流程异常：{e}")
             self.status_signal.emit("重启流程异常")
@@ -548,7 +689,42 @@ class RestartWorker(QObject):
             self.kill_task(task)
         delay = max(0, int(self.config.get("restart_delay_seconds", 10)))
         self.emit_log(f"{delay} 秒后启动...")
-        QTimer.singleShot(delay * 1000, lambda: [self.start_task(t) for t in tasks])
+
+        def start_all():
+            results = [(task, self.start_task(task)) for task in tasks]
+            ok = all(success for _, success in results)
+            self.result_signal.emit(f"{names}：执行成功" if ok else f"{names}：存在启动失败")
+            self.notify_results(results, source.rstrip("，") or "手动")
+
+        QTimer.singleShot(delay * 1000, start_all)
+
+    def notify_results(self, results, source):
+        """按任务勾选的企业微信通知发送执行结果，key 来自设置。"""
+        wecom_key = (self.config.get("wecom_key") or "").strip()
+        targets = [(task, ok) for task, ok in results if task.get("wecom_notify")]
+        if not targets:
+            return
+        if not wecom_key:
+            self.emit_log("有任务勾选了企业微信通知，但设置里未填写 key，跳过通知")
+            return
+        try:
+            lines = [
+                "### 应用重启通知",
+                f">来源: {source}",
+                f">主机: {socket.gethostname()}",
+                f">时间: {datetime.now():%Y-%m-%d %H:%M:%S}",
+            ]
+            for task, ok in targets:
+                color = "info" if ok else "warning"
+                text = "成功" if ok else "失败"
+                lines.append(f">**{task.get('name', '未命名任务')}**: <font color=\"{color}\">{text}</font>")
+            reply = send_wecom_notify(wecom_key, "\n".join(lines))
+            if reply.get("errcode") == 0:
+                self.emit_log("企业微信通知发送成功")
+            else:
+                self.emit_log(f"企业微信通知发送失败：{reply.get('errmsg')}")
+        except Exception as e:
+            self.emit_log(f"企业微信通知发送异常：{e}")
 
 
 class TaskDialog(QDialog):
@@ -597,6 +773,9 @@ class TaskDialog(QDialog):
         self.admin = QCheckBox("使用管理员身份启动")
         self.admin.setChecked(task.get("run_as_admin", True))
 
+        self.wecom_notify = QCheckBox("企业微信通知（执行结束后发送，key 在设置里填写）")
+        self.wecom_notify.setChecked(task.get("wecom_notify", False))
+
         self.kill_port_enabled.toggled.connect(self.sync_kill_mode_ui)
         self.sync_kill_mode_ui()
 
@@ -610,6 +789,7 @@ class TaskDialog(QDialog):
         form.addRow("启动文件", path_layout)
         form.addRow("文件类型", self.start_type)
         form.addRow("", self.admin)
+        form.addRow("", self.wecom_notify)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
@@ -672,20 +852,161 @@ class TaskDialog(QDialog):
             "kill_port_enabled": self.kill_port_enabled.isChecked(),
             "kill_port": self.kill_port.value(),
             "run_as_admin": self.admin.isChecked(),
+            "wecom_notify": self.wecom_notify.isChecked(),
         }
 
 
+class SettingsDialog(QDialog):
+    """设置弹窗：开机自启、管理员启动、企业微信 key、更新服务器、日志保留。"""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setMinimumWidth(620)
+        self.imported = False
+
+        self.autostart = QCheckBox("开机后自动启动（登录 Windows 后自动运行本程序）")
+        self.autostart.setChecked(get_autostart())
+
+        self.run_admin = QCheckBox("以管理员身份启动（每次启动本程序时请求管理员权限）")
+        self.run_admin.setChecked(get_run_as_admin_flag())
+
+        wecom_row = QHBoxLayout()
+        self.wecom_key = QLineEdit((config.get("wecom_key") or "").strip())
+        self.wecom_key.setPlaceholderText("企业微信群机器人 Webhook 的 key")
+        test_btn = QPushButton("发送测试通知")
+        test_btn.clicked.connect(self.test_wecom)
+        wecom_row.addWidget(self.wecom_key, 1)
+        wecom_row.addWidget(test_btn)
+
+        self.update_url = QLineEdit((config.get("update_url") or "").strip())
+        self.update_url.setPlaceholderText("更新清单地址，如 http://server/updates/AgvAutoRestart.json")
+
+        self.log_days = FlatSpinBox()
+        self.log_days.setRange(1, 365)
+        self.log_days.setSuffix(" 天")
+        self.log_days.setValue(int(config.get("log_retention_days", 30)))
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.addRow("", self.autostart)
+        form.addRow("", self.run_admin)
+        form.addRow("企业微信 Key", wecom_row)
+        form.addRow("更新服务器", self.update_url)
+        form.addRow("日志保留", self.log_days)
+
+        bottom = QHBoxLayout()
+        self.version_label = QLabel(f"当前版本：v{APP_VERSION}")
+        self.version_label.setObjectName("subtitle")
+        bottom.addWidget(self.version_label)
+        bottom.addStretch()
+        export_btn = QPushButton("导出配置")
+        export_btn.clicked.connect(self.export_config)
+        import_btn = QPushButton("导入配置")
+        import_btn.clicked.connect(self.import_config)
+        check_update_btn = QPushButton("检查更新")
+        check_update_btn.clicked.connect(self.check_update)
+        bottom.addWidget(export_btn)
+        bottom.addWidget(import_btn)
+        bottom.addWidget(check_update_btn)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        hint = QLabel(
+            "提示：勾选「以管理员身份启动」后，程序每次启动都会弹出 UAC 确认；"
+            "同时勾选开机自启时，登录后需要点一次确认。"
+            "更新清单为 JSON：{\"version\": \"1.2.0\", \"url\": \"下载地址.exe\", \"notes\": \"更新说明\"}。"
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("subtitle")
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addLayout(bottom)
+        layout.addWidget(hint)
+        layout.addWidget(buttons)
+
+    def get_result(self):
+        return {
+            "autostart": self.autostart.isChecked(),
+            "run_admin": self.run_admin.isChecked(),
+            "wecom_key": self.wecom_key.text().strip(),
+            "update_url": self.update_url.text().strip(),
+            "log_retention_days": self.log_days.value(),
+        }
+
+    def test_wecom(self):
+        key = self.wecom_key.text().strip()
+        if not key:
+            QMessageBox.warning(self, "提示", "请先填写企业微信 Key")
+            return
+        content = (
+            "### 测试通知\n"
+            f">主机: {socket.gethostname()}\n"
+            f">时间: {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f">{APP_NAME} 企业微信通知配置正常"
+        )
+        try:
+            reply = send_wecom_notify(key, content)
+            if reply.get("errcode") == 0:
+                QMessageBox.information(self, "测试通知", "发送成功，请到企业微信群查看")
+            else:
+                QMessageBox.warning(self, "测试通知", f"发送失败：{reply.get('errmsg')}")
+        except Exception as e:
+            QMessageBox.warning(self, "测试通知", f"发送异常：{e}")
+
+    def check_update(self):
+        self.parent().check_for_update(url_override=self.update_url.text().strip())
+
+    def export_config(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出配置", "AgvAutoRestart-config.json", "JSON 文件 (*.json)")
+        if not path:
+            return
+        try:
+            shutil.copyfile(CONFIG_FILE, path)
+            QMessageBox.information(self, "导出配置", f"配置已导出到：\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出配置", f"导出失败：{e}")
+
+    def import_config(self):
+        path, _ = QFileDialog.getOpenFileName(self, "导入配置", "", "JSON 文件 (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+            shutil.copyfile(path, CONFIG_FILE)
+        except Exception as e:
+            QMessageBox.warning(self, "导入配置", f"导入失败：{e}")
+            return
+        self.imported = True
+        QMessageBox.information(self, "导入配置", "配置已导入，窗口将重新加载配置")
+        self.accept()
+
+
 class MainWindow(QMainWindow):
+    check_requested = Signal(bool)
+    run_tasks_requested = Signal(list, str)
+
     def __init__(self):
         super().__init__()
         self.config = load_config()
         self.worker = RestartWorker(self.config)
 
+        # 重启/检查等耗时操作放到独立线程，避免阻塞 UI（HTTP 请求、taskkill、sleep、UAC 启动等待）
+        self.worker_thread = QThread(self)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.start()
+
         self.monitor_state = {}
         self.quitting = False
         self.tray_notice_shown = False
 
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1180, 860)
         self.setMinimumSize(960, 720)
         self.build_ui()
@@ -704,7 +1025,14 @@ class MainWindow(QMainWindow):
 
         self.worker.log_signal.connect(self.append_log)
         self.worker.status_signal.connect(self.set_status)
+        self.worker.result_signal.connect(self.append_log)
         self.worker.today_restart_signal.connect(self.update_today_badge)
+
+        # 队列连接：信号在工作线程的事件循环里执行，不占用 UI 线程
+        self.check_requested.connect(self.worker.check_once)
+        self.run_tasks_requested.connect(self.worker.run_tasks_once)
+
+        cleanup_old_logs(int(self.config.get("log_retention_days", 30)))
 
         self.append_log(f"程序启动，配置文件：{CONFIG_FILE}")
         self.set_status("监控已启动")
@@ -734,11 +1062,18 @@ class MainWindow(QMainWindow):
         self.clock_label = QLabel()
         self.clock_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
+        self.settings_btn = QPushButton("⚙")
+        self.settings_btn.setObjectName("iconBtn")
+        self.settings_btn.setToolTip("设置")
+        self.settings_btn.setFixedSize(36, 32)
+        self.settings_btn.clicked.connect(self.open_settings)
+
         card_layout.addWidget(self.status_label)
         card_layout.addWidget(self.today_badge)
         card_layout.addWidget(self.reset_today_btn)
         card_layout.addStretch()
         card_layout.addWidget(self.clock_label)
+        card_layout.addWidget(self.settings_btn)
         root.addWidget(card)
 
         # 监控配置（紧凑布局）
@@ -899,8 +1234,9 @@ class MainWindow(QMainWindow):
             else:
                 mode_text = MATCH_MODE_TEXT.get(task.get("match_mode", "name"), "进程名")
                 kill_text = f"{mode_text}包含「{task.get('process_keyword', '')}」"
+            notify_text = "，企业微信通知" if task.get("wecom_notify") else ""
             text = (
-                f"{i + 1}. [{enabled}] {task.get('name', '')}\n"
+                f"{i + 1}. [{enabled}] {task.get('name', '')}{notify_text}\n"
                 f"   结束：{kill_text}\n"
                 f"   启动：{task.get('start_path', '')}"
             )
@@ -1009,7 +1345,7 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(
             self, "确认执行", f"立即执行一次「{name}」？\n将结束进程/端口，{delay} 秒后重新启动。"
         ) == QMessageBox.StandardButton.Yes:
-            self.worker.run_tasks_once([task])
+            self.run_tasks_requested.emit([task], "手动")
 
     def reset_today_flag(self):
         self.worker.last_restart_date = None
@@ -1023,7 +1359,117 @@ class MainWindow(QMainWindow):
 
     def manual_check(self):
         if self.save_ui_config():
-            self.worker.check_once(force=True)
+            self.check_requested.emit(True)
+
+    def open_settings(self):
+        dlg = SettingsDialog(self.config, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.imported:
+            self.config = load_config()
+            self.worker.config = self.config
+            self.load_ui_from_config()
+            self.append_log("已导入并重新加载配置")
+            return
+        result = dlg.get_result()
+        try:
+            set_autostart(result["autostart"])
+            set_run_as_admin_flag(result["run_admin"])
+        except Exception as e:
+            QMessageBox.warning(self, "设置失败", f"写入开机自启/管理员设置失败：{e}")
+        self.config["wecom_key"] = result["wecom_key"]
+        self.config["update_url"] = result["update_url"]
+        self.config["log_retention_days"] = result["log_retention_days"]
+        save_config(self.config)
+        self.worker.config = self.config
+        self.append_log("设置已保存")
+        self.set_status("设置已保存")
+
+    def check_for_update(self, silent=False, url_override=None):
+        url = (url_override if url_override is not None else self.config.get("update_url", "")).strip()
+        if not url:
+            if not silent:
+                QMessageBox.information(self, "检查更新", "请先在设置里填写更新服务器地址")
+            return
+        try:
+            info = fetch_update_info(url)
+        except Exception as e:
+            self.append_log(f"检查更新失败：{e}")
+            if not silent:
+                QMessageBox.warning(self, "检查更新", f"检查更新失败：{e}")
+            return
+
+        remote_version = str(info.get("version", "")).strip()
+        download_url = (info.get("url") or info.get("download_url") or "").strip()
+        notes = str(info.get("notes", "")).strip()
+        if not remote_version or not download_url:
+            if not silent:
+                QMessageBox.warning(self, "检查更新", "更新清单缺少 version 或 url 字段")
+            return
+
+        if parse_version(remote_version) <= parse_version(APP_VERSION):
+            self.append_log(f"检查更新：当前已是最新版本 v{APP_VERSION}")
+            if not silent:
+                QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}")
+            return
+
+        message = f"发现新版本 v{remote_version}（当前 v{APP_VERSION}）"
+        if notes:
+            message += f"\n\n更新说明：\n{notes}"
+        message += "\n\n是否立即下载并更新？"
+        if QMessageBox.question(self, "检查更新", message) == QMessageBox.StandardButton.Yes:
+            self.apply_update(download_url, remote_version)
+
+    def apply_update(self, url, version):
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(self, "提示", "开发模式（python main.py）不支持自动更新，请打包成 EXE 后使用")
+            return
+        exe_path = Path(sys.executable).resolve()
+        tmp_path = exe_path.with_name(f"{exe_path.stem}_{version}_new.exe")
+        try:
+            self.set_status(f"正在下载新版本 v{version} ...")
+            self.append_log(f"开始下载新版本 v{version}：{url}")
+            download_file(url, tmp_path)
+        except Exception as e:
+            self.set_status("新版本下载失败")
+            QMessageBox.critical(self, "更新失败", f"下载新版本失败：{e}")
+            return
+
+        # 退出后由外部 bat 等待进程结束 -> 替换 EXE -> 重新启动 -> 自删
+        bat_path = Path(os.environ.get("TEMP", str(CONFIG_DIR))) / "AgvAutoRestart_updater.bat"
+        script = "\r\n".join([
+            "@echo off",
+            f'set "PID={os.getpid()}"',
+            f'set "SRC={tmp_path}"',
+            f'set "DST={exe_path}"',
+            ":wait",
+            'tasklist /FI "PID eq %PID%" | find "%PID%" >nul && (',
+            "    timeout /t 1 /nobreak >nul",
+            "    goto wait",
+            ")",
+            'move /y "%SRC%" "%DST%" >nul',
+            "if errorlevel 1 exit /b 1",
+            'start "" "%DST%"',
+            '(goto) 2>nul & del "%~f0"',
+        ]) + "\r\n"
+        try:
+            bat_path.write_text(script, encoding="ascii")
+            subprocess.Popen(
+                [os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe"), "/c", str(bat_path)],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "更新失败", f"启动更新脚本失败：{e}")
+            return
+
+        self.append_log(f"新版本 v{version} 下载完成，即将退出并完成更新")
+        try:
+            self.save_ui_config()
+        except Exception:
+            pass
+        self.quitting = True
+        self.tray_icon.hide()
+        QApplication.quit()
 
     def on_timer(self):
         self.on_port_monitor()
@@ -1041,10 +1487,10 @@ class MainWindow(QMainWindow):
         current = time.monotonic()
         if self.worker.last_check_monotonic == 0:
             self.worker.last_check_monotonic = current
-            self.worker.check_once()
+            self.check_requested.emit(False)
         elif current - self.worker.last_check_monotonic >= interval_seconds:
             self.worker.last_check_monotonic = current
-            self.worker.check_once()
+            self.check_requested.emit(False)
 
     def refresh_pm_task_combo(self):
         for record in self.pm_pages:
@@ -1190,7 +1636,7 @@ class MainWindow(QMainWindow):
                 self.worker.emit_log(f"端口 {port} 连不上，但没有可执行的重启任务")
                 continue
             st["last_trigger"] = current
-            self.worker.run_tasks_once(tasks, source=f"端口 {port} 连不上，")
+            self.run_tasks_requested.emit(tasks, f"端口 {port} 连不上，")
 
     def update_clock(self):
         self.clock_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -1241,6 +1687,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.tray_icon.hide()
+        self.worker_thread.quit()
+        self.worker_thread.wait(2000)
         QApplication.quit()
 
     def closeEvent(self, event):
@@ -1348,6 +1796,22 @@ QPushButton#primary {
 QPushButton#primary:hover {
     background: #1d4ed8;
     border-color: #1d4ed8;
+}
+QPushButton#iconBtn {
+    background: transparent;
+    border: 1px solid transparent;
+    font-size: 18px;
+    color: #475569;
+    padding: 0px;
+    min-height: 0px;
+}
+QPushButton#iconBtn:hover {
+    background: #e9eef5;
+    border-color: #cbd5e1;
+    color: #1d4ed8;
+}
+QPushButton#iconBtn:pressed {
+    background: #dbe3ee;
 }
 QLabel#log {
     color: #475569;
