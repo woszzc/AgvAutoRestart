@@ -29,5 +29,15 @@
       "start_type": "bat",
       "run_as_admin": true
     }
+  ],
+  "port_monitors": [
+    {
+      "enabled": false,
+      "weekdays": [0, 1, 2, 3, 4, 5, 6],
+      "interval_minutes": 1,
+      "port": 0,
+      "cooldown_minutes": 10,
+      "task_index": -1
+    }
   ]
 }

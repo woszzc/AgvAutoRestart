@@ -2,6 +2,7 @@ import ctypes
 import csv
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -10,15 +11,17 @@ from datetime import datetime, time as dt_time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QSpinBox, QVBoxLayout, QWidget
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget
 )
 
 APP_NAME = "智能应用定时重启"
+BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+ICON_FILE = BASE_DIR / "app.ico"
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "AgvAutoRestart"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_DIR = CONFIG_DIR / "logs"
@@ -53,6 +56,16 @@ DEFAULT_CONFIG = {
             "run_as_admin": True,
         },
     ],
+    "port_monitors": [
+        {
+            "enabled": False,
+            "weekdays": [0, 1, 2, 3, 4, 5, 6],
+            "interval_minutes": 1,
+            "port": 0,
+            "cooldown_minutes": 10,
+            "task_index": -1,  # -1 表示执行全部启用任务
+        }
+    ],
 }
 
 
@@ -77,6 +90,15 @@ def load_config():
                 task.setdefault("match_mode", "name")
             task.setdefault("kill_port_enabled", False)
             task.setdefault("kill_port", 0)
+        if "port_monitors" not in merged:
+            # 旧配置：单个 port_monitor 字典 -> 转成列表
+            merged["port_monitors"] = [merged.get("port_monitor", {})]
+        merged.pop("port_monitor", None)
+        if not merged["port_monitors"]:
+            merged["port_monitors"].append({})
+        for mon in merged["port_monitors"]:
+            for key, value in DEFAULT_CONFIG["port_monitors"][0].items():
+                mon.setdefault(key, json.loads(json.dumps(value)))
         return merged
     except Exception:
         save_config(DEFAULT_CONFIG)
@@ -314,6 +336,15 @@ def http_get_json(url, timeout=10):
     return json.loads(raw.decode("utf-8"))
 
 
+def check_port_open(port, host="127.0.0.1", timeout=3):
+    """尝试 TCP 连接指定端口，连上返回 True，连不上返回 False。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 class RestartWorker(QObject):
     log_signal = Signal(str)
     status_signal = Signal(str)
@@ -445,15 +476,16 @@ class RestartWorker(QObject):
             self.emit_log(f"{name}：启动失败：{e}")
             return False
 
-    def run_task_once(self, task):
-        """手动执行单个任务：结束进程/端口 -> 等待 -> 启动，不占用 UI 线程。"""
-        name = task.get("name", "未命名任务")
-        self.emit_log(f"手动执行任务：{name}")
-        self.status_signal.emit(f"正在手动执行：{name}")
-        self.kill_task(task)
+    def run_tasks_once(self, tasks, source="手动"):
+        """执行一组任务：结束进程/端口 -> 等待 -> 启动，不占用 UI 线程。"""
+        names = "、".join(t.get("name", "未命名任务") for t in tasks)
+        self.emit_log(f"{source}执行任务：{names}")
+        self.status_signal.emit(f"正在执行：{names}")
+        for task in tasks:
+            self.kill_task(task)
         delay = max(0, int(self.config.get("restart_delay_seconds", 10)))
-        self.emit_log(f"{name}：{delay} 秒后启动...")
-        QTimer.singleShot(delay * 1000, lambda: self.start_task(task))
+        self.emit_log(f"{delay} 秒后启动...")
+        QTimer.singleShot(delay * 1000, lambda: [self.start_task(t) for t in tasks])
 
 
 class TaskDialog(QDialog):
@@ -586,6 +618,8 @@ class MainWindow(QMainWindow):
         self.config = load_config()
         self.worker = RestartWorker(self.config)
 
+        self.monitor_state = {}
+
         self.setWindowTitle(APP_NAME)
         self.resize(920, 680)
         self.build_ui()
@@ -648,12 +682,12 @@ class MainWindow(QMainWindow):
         card_layout.addWidget(self.clock_label)
         root.addWidget(card)
 
-        # 监控配置
+        # 监控配置（紧凑布局）
         config_card = QFrame()
         config_card.setObjectName("card")
         form = QFormLayout(config_card)
-        form.setContentsMargins(18, 16, 18, 16)
-        form.setSpacing(10)
+        form.setContentsMargins(14, 10, 14, 10)
+        form.setSpacing(6)
 
         self.api_url = QLineEdit()
         self.interval = QSpinBox()
@@ -690,14 +724,38 @@ class MainWindow(QMainWindow):
         schedule.addWidget(self.start_time)
         schedule.addWidget(QLabel("结束"))
         schedule.addWidget(self.end_time)
+        schedule.addWidget(QLabel("等待"))
+        schedule.addWidget(self.delay)
         schedule.addStretch()
 
         form.addRow("检查接口", self.api_url)
         form.addRow("时间安排", schedule)
         form.addRow("执行星期", days)
-        form.addRow("重启等待", self.delay)
 
         root.addWidget(config_card)
+
+        # 端口监控（多标签页，每页一个端口）
+        pm_header = QHBoxLayout()
+        pm_title = QLabel("端口监控")
+        pm_title.setObjectName("section")
+        pm_header.addWidget(pm_title)
+        pm_header.addStretch()
+        pm_add_btn = QPushButton("+ 新增页")
+        pm_add_btn.clicked.connect(lambda: self.add_pm_page())
+        pm_del_btn = QPushButton("删除当前页")
+        pm_del_btn.clicked.connect(self.remove_pm_page)
+        pm_header.addWidget(pm_add_btn)
+        pm_header.addWidget(pm_del_btn)
+        root.addLayout(pm_header)
+
+        self.pm_tabs = QTabWidget()
+        self.pm_pages = []
+        pm_card = QFrame()
+        pm_card.setObjectName("card")
+        pm_card_layout = QVBoxLayout(pm_card)
+        pm_card_layout.setContentsMargins(10, 8, 10, 10)
+        pm_card_layout.addWidget(self.pm_tabs)
+        root.addWidget(pm_card)
 
         # 任务列表
         task_header = QHBoxLayout()
@@ -724,7 +782,7 @@ class MainWindow(QMainWindow):
         self.task_list = QListWidget()
         self.task_list.setMinimumHeight(150)
         self.task_list.itemDoubleClicked.connect(lambda _: self.edit_task())
-        root.addWidget(self.task_list)
+        root.addWidget(self.task_list, 1)
 
         # 底部
         bottom = QHBoxLayout()
@@ -767,6 +825,12 @@ class MainWindow(QMainWindow):
         self.enabled.setChecked(c.get("enabled", True))
         self.refresh_task_list()
 
+        while self.pm_tabs.count():
+            self.pm_tabs.removeTab(0)
+        self.pm_pages = []
+        for monitor in c.get("port_monitors", []):
+            self.add_pm_page(monitor)
+
     def refresh_task_list(self):
         self.task_list.clear()
         for i, task in enumerate(self.config.get("tasks", [])):
@@ -784,6 +848,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, i)
             self.task_list.addItem(item)
+        self.refresh_pm_task_combo()
 
     def save_ui_config(self):
         try:
@@ -810,6 +875,26 @@ class MainWindow(QMainWindow):
         self.config["end_time"] = self.end_time.text().strip()
         self.config["weekdays"] = weekdays
         self.config["restart_delay_seconds"] = self.delay.value()
+
+        monitors = []
+        for record in self.pm_pages:
+            pm_weekdays = [check.property("weekday") for check in record["week_checks"] if check.isChecked()]
+            if record["enabled"].isChecked():
+                if record["port"].value() <= 0:
+                    QMessageBox.warning(self, "配置错误", "端口监控：请填写监控端口号")
+                    return
+                if not pm_weekdays:
+                    QMessageBox.warning(self, "配置错误", "端口监控：至少选择一个执行星期")
+                    return
+            monitors.append({
+                "enabled": record["enabled"].isChecked(),
+                "weekdays": pm_weekdays,
+                "interval_minutes": record["interval"].value(),
+                "port": record["port"].value(),
+                "cooldown_minutes": record["cooldown"].value(),
+                "task_index": record["task"].currentData(),
+            })
+        self.config["port_monitors"] = monitors
 
         save_config(self.config)
         self.worker.config = self.config
@@ -864,7 +949,7 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(
             self, "确认执行", f"立即执行一次「{name}」？\n将结束进程/端口，{delay} 秒后重新启动。"
         ) == QMessageBox.StandardButton.Yes:
-            self.worker.run_task_once(task)
+            self.worker.run_tasks_once([task])
 
     def reset_today_flag(self):
         self.worker.last_restart_date = None
@@ -881,6 +966,8 @@ class MainWindow(QMainWindow):
         self.worker.check_once(force=True)
 
     def on_timer(self):
+        self.on_port_monitor()
+
         now = datetime.now()
         if not self.worker.in_schedule(now):
             self.set_status("当前不在执行时间段")
@@ -898,6 +985,152 @@ class MainWindow(QMainWindow):
         elif current - self.worker.last_check_monotonic >= interval_seconds:
             self.worker.last_check_monotonic = current
             self.worker.check_once()
+
+    def refresh_pm_task_combo(self):
+        for record in self.pm_pages:
+            combo = record["task"]
+            current = combo.currentData()
+            combo.clear()
+            combo.addItem("全部启用任务", -1)
+            for i, task in enumerate(self.config.get("tasks", [])):
+                combo.addItem(task.get("name", f"任务 {i + 1}"), i)
+            index = combo.findData(current)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
+    def add_pm_page(self, monitor=None):
+        """新增一个端口监控标签页。"""
+        monitor = monitor or {}
+        page = QWidget()
+        form = QFormLayout(page)
+        form.setContentsMargins(12, 10, 12, 10)
+        form.setSpacing(6)
+
+        enabled = QCheckBox("启用本页端口监控（端口连不上时自动执行重启任务）")
+        enabled.setChecked(monitor.get("enabled", False))
+
+        port = QSpinBox()
+        port.setRange(0, 65535)
+        port.setSpecialValueText("未设置")
+        port.setValue(int(monitor.get("port", 0) or 0))
+
+        interval = QSpinBox()
+        interval.setRange(1, 1440)
+        interval.setSuffix(" 分钟")
+        interval.setValue(int(monitor.get("interval_minutes", 1)))
+
+        cooldown = QSpinBox()
+        cooldown.setRange(1, 1440)
+        cooldown.setSuffix(" 分钟")
+        cooldown.setValue(int(monitor.get("cooldown_minutes", 10)))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("端口"))
+        row.addWidget(port)
+        row.addWidget(QLabel("间隔"))
+        row.addWidget(interval)
+        row.addWidget(QLabel("冷却"))
+        row.addWidget(cooldown)
+        row.addStretch()
+
+        week_checks = []
+        for i, name in enumerate(["周一", "周二", "周三", "周四", "周五", "周六", "周日"]):
+            check = QCheckBox(name)
+            check.setProperty("weekday", i)
+            check.setChecked(i in monitor.get("weekdays", list(range(7))))
+            week_checks.append(check)
+        days = QHBoxLayout()
+        for check in week_checks:
+            days.addWidget(check)
+        days.addStretch()
+
+        task = QComboBox()
+
+        form.addRow("", enabled)
+        form.addRow("检查安排", row)
+        form.addRow("执行星期", days)
+        form.addRow("执行任务", task)
+
+        record = {
+            "widget": page, "enabled": enabled, "port": port,
+            "interval": interval, "cooldown": cooldown,
+            "week_checks": week_checks, "task": task,
+        }
+        self.pm_pages.append(record)
+        port.valueChanged.connect(
+            lambda value, r=record: self.pm_tabs.setTabText(
+                self.pm_tabs.indexOf(r["widget"]), f"端口 {value if value else '未设置'}"
+            )
+        )
+        self.pm_tabs.addTab(page, f"端口 {port.value() if port.value() else '未设置'}")
+        self.pm_tabs.setCurrentWidget(page)
+        self.refresh_pm_task_combo()
+        index = task.findData(monitor.get("task_index", -1))
+        if index >= 0:
+            task.setCurrentIndex(index)
+        return record
+
+    def remove_pm_page(self):
+        index = self.pm_tabs.currentIndex()
+        if index < 0:
+            QMessageBox.information(self, "提示", "没有可删除的端口监控页")
+            return
+        title = self.pm_tabs.tabText(index)
+        if QMessageBox.question(self, "确认删除", f"确定删除「{title}」吗？") != QMessageBox.StandardButton.Yes:
+            return
+        self.pm_tabs.removeTab(index)
+        self.pm_pages.pop(index)
+        self.monitor_state.clear()
+        self.save_ui_config()
+
+    def resolve_pm_tasks(self, pm):
+        tasks = self.config.get("tasks", [])
+        index = pm.get("task_index", -1)
+        if isinstance(index, int) and 0 <= index < len(tasks):
+            return [tasks[index]]
+        return [t for t in tasks if t.get("enabled", True)]
+
+    def on_port_monitor(self):
+        now = datetime.now()
+        current = time.monotonic()
+        for i, pm in enumerate(self.config.get("port_monitors", [])):
+            if not pm.get("enabled"):
+                continue
+            if now.weekday() not in pm.get("weekdays", list(range(7))):
+                continue
+            port = int(pm.get("port", 0) or 0)
+            if port <= 0:
+                continue
+
+            st = self.monitor_state.setdefault(
+                i, {"last_check": 0.0, "last_trigger": float("-inf"), "port_up": None}
+            )
+            interval_seconds = max(30, int(pm.get("interval_minutes", 1)) * 60)
+            if st["last_check"] and current - st["last_check"] < interval_seconds:
+                continue
+            st["last_check"] = current
+
+            up = check_port_open(port)
+            if up:
+                if st["port_up"] is not True:
+                    self.worker.emit_log(f"端口监控：端口 {port} 恢复可达")
+                st["port_up"] = True
+                continue
+
+            if st["port_up"] is not False:
+                self.worker.emit_log(f"端口监控：端口 {port} 连不上")
+            st["port_up"] = False
+
+            cooldown_seconds = max(1, int(pm.get("cooldown_minutes", 10))) * 60
+            if current - st["last_trigger"] < cooldown_seconds:
+                continue
+
+            tasks = self.resolve_pm_tasks(pm)
+            if not tasks:
+                self.worker.emit_log(f"端口 {port} 连不上，但没有可执行的重启任务")
+                continue
+            st["last_trigger"] = current
+            self.worker.run_tasks_once(tasks, source=f"端口 {port} 连不上，")
 
     def update_clock(self):
         self.clock_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -1004,6 +1237,23 @@ QLabel#log {
 QCheckBox {
     spacing: 6px;
 }
+QTabWidget::pane {
+    border: none;
+    background: transparent;
+}
+QTabBar::tab {
+    background: #eef2f7;
+    border: 1px solid #e4e8ef;
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+    padding: 5px 14px;
+    margin-right: 4px;
+}
+QTabBar::tab:selected {
+    background: white;
+    color: #1e56c8;
+    font-weight: 700;
+}
 """
 
 
@@ -1012,9 +1262,17 @@ def main():
         QMessageBox.critical(None, "系统不支持", "此程序的进程结束和管理员启动功能针对 Windows。")
         return
 
+    # 声明 AppUserModelID，让任务栏/窗口显示自己的图标而不是 Python 图标
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AgvAutoRestart.App")
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyleSheet(STYLE)
+    if ICON_FILE.exists():
+        app.setWindowIcon(QIcon(str(ICON_FILE)))
 
     window = MainWindow()
     window.show()

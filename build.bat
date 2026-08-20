@@ -17,7 +17,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 
 echo [3/4] 开始 PyInstaller 打包...
-pyinstaller --noconfirm --clean --windowed --onefile --name AgvAutoRestart main.py
+pyinstaller --noconfirm --clean --windowed --onefile --name AgvAutoRestart --icon=app.ico --add-data "app.ico;." main.py
 
 echo [4/4] 打包完成
 echo.
