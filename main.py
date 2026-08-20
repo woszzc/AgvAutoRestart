@@ -13,7 +13,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPointF
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
     QProxyStyle, QPushButton, QSpinBox, QStyle, QSystemTrayIcon,
@@ -121,6 +121,15 @@ class AppStyle(QProxyStyle):
                 QPointF(rect.right() - 4, rect.center().y()),
             )
         painter.restore()
+
+
+class FlatSpinBox(QSpinBox):
+    """Numeric input without stepper buttons, with value and suffix left aligned."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
 
 def load_config():
@@ -580,7 +589,7 @@ class TaskDialog(QDialog):
 
         self.kill_port_enabled = QCheckBox("杀掉端口（勾选后代替结束进程）")
         self.kill_port_enabled.setChecked(task.get("kill_port_enabled", False))
-        self.kill_port = QSpinBox()
+        self.kill_port = FlatSpinBox()
         self.kill_port.setRange(1, 65535)
         port = int(task.get("kill_port", 0) or 0)
         self.kill_port.setValue(port if port > 0 else 8080)
@@ -677,8 +686,8 @@ class MainWindow(QMainWindow):
         self.tray_notice_shown = False
 
         self.setWindowTitle(APP_NAME)
-        self.resize(960, 700)
-        self.setMinimumSize(820, 620)
+        self.resize(1180, 860)
+        self.setMinimumSize(960, 720)
         self.build_ui()
         self.load_ui_from_config()
         self.setup_tray()
@@ -740,7 +749,7 @@ class MainWindow(QMainWindow):
         form.setSpacing(6)
 
         self.api_url = QLineEdit()
-        self.interval = QSpinBox()
+        self.interval = FlatSpinBox()
         self.interval.setRange(1, 1440)
         self.interval.setSuffix(" 分钟")
 
@@ -763,7 +772,7 @@ class MainWindow(QMainWindow):
 
         days.addStretch()
 
-        self.delay = QSpinBox()
+        self.delay = FlatSpinBox()
         self.delay.setRange(0, 3600)
         self.delay.setSuffix(" 秒")
 
@@ -1060,17 +1069,17 @@ class MainWindow(QMainWindow):
         enabled = QCheckBox("启用本页端口监控（端口连不上时自动执行重启任务）")
         enabled.setChecked(monitor.get("enabled", False))
 
-        port = QSpinBox()
+        port = FlatSpinBox()
         port.setRange(0, 65535)
         port.setSpecialValueText("未设置")
         port.setValue(int(monitor.get("port", 0) or 0))
 
-        interval = QSpinBox()
+        interval = FlatSpinBox()
         interval.setRange(1, 1440)
         interval.setSuffix(" 分钟")
         interval.setValue(int(monitor.get("interval_minutes", 1)))
 
-        cooldown = QSpinBox()
+        cooldown = FlatSpinBox()
         cooldown.setRange(1, 1440)
         cooldown.setSuffix(" 分钟")
         cooldown.setValue(int(monitor.get("cooldown_minutes", 10)))
