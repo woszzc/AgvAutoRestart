@@ -10,13 +10,14 @@ import traceback
 from datetime import datetime, time as dt_time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPointF
+from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QSpinBox, QTabWidget, QVBoxLayout, QWidget
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QProxyStyle, QPushButton, QSpinBox, QStyle, QSystemTrayIcon,
+    QTabWidget, QVBoxLayout, QWidget
 )
 
 APP_NAME = "智能应用定时重启"
@@ -67,6 +68,59 @@ DEFAULT_CONFIG = {
         }
     ],
 }
+
+
+class AppStyle(QProxyStyle):
+    """Keep checkbox indicators clear and consistent across Windows themes."""
+
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric in (QStyle.PixelMetric.PM_IndicatorWidth, QStyle.PixelMetric.PM_IndicatorHeight):
+            return 18
+        return super().pixelMetric(metric, option, widget)
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element != QStyle.PrimitiveElement.PE_IndicatorCheckBox:
+            return super().drawPrimitive(element, option, painter, widget)
+
+        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+        checked = bool(option.state & QStyle.StateFlag.State_On)
+        partial = bool(option.state & QStyle.StateFlag.State_NoChange)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        border = QColor("#2563eb") if checked or partial else QColor("#94a3b8")
+        fill = QColor("#2563eb") if checked or partial else QColor("#ffffff")
+        if hovered and not checked and not partial:
+            border = QColor("#3b82f6")
+            fill = QColor("#eff6ff")
+        if not enabled:
+            border = QColor("#cbd5e1")
+            fill = QColor("#e2e8f0") if checked or partial else QColor("#f8fafc")
+
+        rect = option.rect.adjusted(1, 1, -1, -1)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(border, 1.5))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect, 4, 4)
+
+        if checked:
+            tick = QColor("#ffffff") if enabled else QColor("#94a3b8")
+            painter.setPen(QPen(tick, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.drawLine(
+                QPointF(rect.left() + 4, rect.center().y()),
+                QPointF(rect.left() + 7.5, rect.bottom() - 4),
+            )
+            painter.drawLine(
+                QPointF(rect.left() + 7.5, rect.bottom() - 4),
+                QPointF(rect.right() - 3.5, rect.top() + 4),
+            )
+        elif partial:
+            painter.setPen(QPen(QColor("#ffffff"), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(
+                QPointF(rect.left() + 4, rect.center().y()),
+                QPointF(rect.right() - 4, rect.center().y()),
+            )
+        painter.restore()
 
 
 def load_config():
@@ -619,11 +673,15 @@ class MainWindow(QMainWindow):
         self.worker = RestartWorker(self.config)
 
         self.monitor_state = {}
+        self.quitting = False
+        self.tray_notice_shown = False
 
         self.setWindowTitle(APP_NAME)
-        self.resize(920, 680)
+        self.resize(960, 700)
+        self.setMinimumSize(820, 620)
         self.build_ui()
         self.load_ui_from_config()
+        self.setup_tray()
 
         self.timer = QTimer(self)
         self.timer.setInterval(10_000)
@@ -647,22 +705,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-        root.setContentsMargins(22, 20, 22, 20)
-        root.setSpacing(14)
-
-        title = QLabel("智能应用定时重启")
-        title.setObjectName("title")
-        root.addWidget(title)
-
-        subtitle = QLabel("按周一 / 周三 / 周五，在指定时间检查 AGV 未完成任务；任务为空时自动重启配置的应用。")
-        subtitle.setObjectName("subtitle")
-        root.addWidget(subtitle)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
 
         # 状态卡片
         card = QFrame()
         card.setObjectName("card")
         card_layout = QHBoxLayout(card)
-        card_layout.setContentsMargins(18, 14, 18, 14)
+        card_layout.setContentsMargins(14, 10, 14, 10)
 
         self.status_label = QLabel("监控状态")
         self.status_label.setObjectName("status")
@@ -753,7 +803,7 @@ class MainWindow(QMainWindow):
         pm_card = QFrame()
         pm_card.setObjectName("card")
         pm_card_layout = QVBoxLayout(pm_card)
-        pm_card_layout.setContentsMargins(10, 8, 10, 10)
+        pm_card_layout.setContentsMargins(8, 6, 8, 8)
         pm_card_layout.addWidget(self.pm_tabs)
         root.addWidget(pm_card)
 
@@ -856,7 +906,7 @@ class MainWindow(QMainWindow):
             datetime.strptime(self.end_time.text().strip(), "%H:%M")
         except ValueError:
             QMessageBox.warning(self, "配置错误", "开始时间和结束时间必须是 HH:mm，例如 08:00")
-            return
+            return False
 
         weekdays = []
 
@@ -866,7 +916,7 @@ class MainWindow(QMainWindow):
 
         if not weekdays:
             QMessageBox.warning(self, "配置错误", "至少选择一个执行星期")
-            return
+            return False
 
         self.config["enabled"] = self.enabled.isChecked()
         self.config["api_url"] = self.api_url.text().strip()
@@ -882,10 +932,10 @@ class MainWindow(QMainWindow):
             if record["enabled"].isChecked():
                 if record["port"].value() <= 0:
                     QMessageBox.warning(self, "配置错误", "端口监控：请填写监控端口号")
-                    return
+                    return False
                 if not pm_weekdays:
                     QMessageBox.warning(self, "配置错误", "端口监控：至少选择一个执行星期")
-                    return
+                    return False
             monitors.append({
                 "enabled": record["enabled"].isChecked(),
                 "weekdays": pm_weekdays,
@@ -901,6 +951,7 @@ class MainWindow(QMainWindow):
         self.worker.last_check_monotonic = 0
         self.append_log("配置已保存")
         self.set_status("配置已保存，监控继续运行")
+        return True
 
     def add_task(self):
         dlg = TaskDialog(parent=self)
@@ -962,8 +1013,8 @@ class MainWindow(QMainWindow):
         self.reset_today_btn.setVisible(bool(restarted))
 
     def manual_check(self):
-        self.save_ui_config()
-        self.worker.check_once(force=True)
+        if self.save_ui_config():
+            self.worker.check_once(force=True)
 
     def on_timer(self):
         self.on_port_monitor()
@@ -1144,115 +1195,205 @@ class MainWindow(QMainWindow):
     def open_log_dir(self):
         os.startfile(str(LOG_DIR))
 
-    def closeEvent(self, event):
+    def setup_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.windowIcon())
+        self.tray_icon.setToolTip(APP_NAME)
+
+        tray_menu = QMenu(self)
+        show_action = QAction("显示主窗口", self)
+        show_action.triggered.connect(self.show_from_tray)
+        quit_action = QAction("退出应用", self)
+        quit_action.triggered.connect(self.quit_application)
+        tray_menu.addAction(show_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show_from_tray()
+
+    def quit_application(self):
+        self.quitting = True
         try:
-            self.save_ui_config()
+            if not self.save_ui_config():
+                self.quitting = False
+                self.show_from_tray()
+                return
         except Exception:
             pass
-        event.accept()
+        self.tray_icon.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        if self.quitting:
+            event.accept()
+            return
+
+        try:
+            if not self.save_ui_config():
+                event.ignore()
+                return
+        except Exception:
+            pass
+        self.hide()
+        event.ignore()
+        if not self.tray_notice_shown:
+            self.tray_icon.showMessage(APP_NAME, "已最小化到系统托盘", QSystemTrayIcon.MessageIcon.Information, 2000)
+            self.tray_notice_shown = True
 
 
 STYLE = """
 QMainWindow, QWidget {
-    background: #f5f7fb;
-    color: #202938;
+    background: #f3f6fa;
+    color: #1e293b;
     font-family: "Microsoft YaHei";
     font-size: 14px;
 }
-QLabel#title {
-    font-size: 28px;
-    font-weight: 700;
-    color: #172033;
-}
 QLabel#subtitle {
-    color: #687386;
+    color: #64748b;
     font-size: 13px;
 }
 QLabel#section {
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 700;
+    color: #0f172a;
 }
 QLabel#status {
-    color: #16834a;
+    color: #15803d;
     font-weight: 700;
 }
 QLabel#badge {
-    background: #fff4e5;
-    color: #d46b08;
-    border: 1px solid #ffd591;
-    border-radius: 10px;
-    padding: 3px 10px;
+    background: #fff7ed;
+    color: #c2410c;
+    border: 1px solid #fdba74;
+    border-radius: 7px;
+    padding: 3px 9px;
     font-weight: 700;
 }
 QFrame#card {
-    background: white;
-    border: 1px solid #e4e8ef;
-    border-radius: 12px;
+    background: #ffffff;
+    border: 1px solid #dbe3ee;
+    border-radius: 8px;
 }
 QLineEdit, QSpinBox, QComboBox, QListWidget {
-    background: white;
-    border: 1px solid #d7dde8;
-    border-radius: 7px;
-    padding: 7px 9px;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 6px 8px;
+    selection-background-color: #2563eb;
 }
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
-    border: 1px solid #5b8def;
+    border: 1px solid #2563eb;
+    background: #ffffff;
+}
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
+    color: #94a3b8;
+    background: #f1f5f9;
+    border-color: #e2e8f0;
 }
 QListWidget {
-    padding: 5px;
+    padding: 4px;
+    outline: none;
 }
 QListWidget::item {
-    padding: 10px;
-    border-radius: 7px;
+    padding: 9px;
+    border-radius: 6px;
     margin: 2px;
+    border: 1px solid transparent;
 }
 QListWidget::item:selected {
-    background: #e9f0ff;
-    color: #1e56c8;
+    background: #eff6ff;
+    color: #1d4ed8;
+    border-color: #bfdbfe;
 }
 QPushButton {
-    background: white;
-    border: 1px solid #d5dbe5;
-    border-radius: 7px;
-    padding: 8px 15px;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 7px 13px;
+    min-height: 18px;
 }
 QPushButton:hover {
-    background: #f0f4fa;
+    background: #f8fafc;
+    border-color: #94a3b8;
+}
+QPushButton:pressed {
+    background: #e2e8f0;
 }
 QPushButton#primary {
-    background: #3678f6;
-    color: white;
-    border: none;
+    background: #2563eb;
+    color: #ffffff;
+    border: 1px solid #2563eb;
     font-weight: 700;
 }
 QPushButton#primary:hover {
-    background: #2868df;
+    background: #1d4ed8;
+    border-color: #1d4ed8;
 }
 QLabel#log {
-    color: #687386;
-    background: #eef2f7;
-    border-radius: 7px;
-    padding: 9px;
+    color: #475569;
+    background: #e9eef5;
+    border-radius: 6px;
+    padding: 8px 10px;
 }
 QCheckBox {
-    spacing: 6px;
+    spacing: 7px;
+    min-height: 22px;
+}
+QCheckBox:hover {
+    color: #1d4ed8;
 }
 QTabWidget::pane {
-    border: none;
-    background: transparent;
+    border: 1px solid #dbe3ee;
+    background: #ffffff;
+    top: -1px;
 }
 QTabBar::tab {
-    background: #eef2f7;
-    border: 1px solid #e4e8ef;
-    border-top-left-radius: 7px;
-    border-top-right-radius: 7px;
-    padding: 5px 14px;
-    margin-right: 4px;
+    background: #e9eef5;
+    color: #475569;
+    border: 1px solid #dbe3ee;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 6px 14px;
+    margin-right: 3px;
 }
 QTabBar::tab:selected {
-    background: white;
-    color: #1e56c8;
+    background: #ffffff;
+    color: #1d4ed8;
     font-weight: 700;
+    border-bottom-color: #ffffff;
+}
+QTabBar::tab:hover:!selected {
+    background: #f1f5f9;
+}
+QMenu {
+    background: #ffffff;
+    color: #1e293b;
+    border: 1px solid #cbd5e1;
+    padding: 5px;
+}
+QMenu::item {
+    padding: 7px 24px;
+    border-radius: 5px;
+}
+QMenu::item:selected {
+    background: #eff6ff;
+    color: #1d4ed8;
+}
+QMenu::separator {
+    height: 1px;
+    background: #e2e8f0;
+    margin: 4px 7px;
 }
 """
 
@@ -1270,6 +1411,8 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setQuitOnLastWindowClosed(False)
+    app.setStyle(AppStyle(app.style()))
     app.setStyleSheet(STYLE)
     if ICON_FILE.exists():
         app.setWindowIcon(QIcon(str(ICON_FILE)))
