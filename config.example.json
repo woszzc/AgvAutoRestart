@@ -1,0 +1,33 @@
+{
+  "enabled": true,
+  "api_url": "http://127.0.0.1:5001/api/app/agv-task/u-nfinished-task",
+  "interval_minutes": 5,
+  "start_time": "08:00",
+  "end_time": "15:00",
+  "weekdays": [0, 2, 4],
+  "restart_delay_seconds": 10,
+  "tasks": [
+    {
+      "enabled": true,
+      "name": "CNCConsole重启",
+      "process_keyword": "HiP.CNCConsole",
+      "match_mode": "name",
+      "kill_port_enabled": false,
+      "kill_port": 0,
+      "start_path": "D:\\Hip\\Hip.CNC.Publish\\HiP.CNCConsole.exe",
+      "start_type": "exe",
+      "run_as_admin": true
+    },
+    {
+      "enabled": true,
+      "name": "AGV重启",
+      "process_keyword": "AGV",
+      "match_mode": "window",
+      "kill_port_enabled": false,
+      "kill_port": 0,
+      "start_path": "C:\\Users\\zhichao.zhu\\Documents\\service\\AGV\\restart.bat",
+      "start_type": "bat",
+      "run_as_admin": true
+    }
+  ]
+}
